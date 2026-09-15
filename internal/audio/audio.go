@@ -1,3 +1,5 @@
+// Package audio mixes local ambience and controls mpv radio playback.
+// An Engine owns its worker and player processes; callers must close it.
 package audio
 
 import (
@@ -24,12 +26,33 @@ import (
 
 //go:embed assets/*
 var assets embed.FS
-var Names = [5]string{"Rainfall", "Brown noise", "Ocean hush", "Birdsong", "Fireplace"}
-var Stations = [4]string{"Lofi Girl · study", "steezyasfuck · hip hop", "Lofi Girl · synthwave", "Lofi Girl · sleep/chill"}
-var URLs = [4]string{"https://www.youtube.com/watch?v=rFZHOHl-L8A", "https://www.youtube.com/watch?v=rPjez8z61rI", "https://www.youtube.com/watch?v=4xDzrJKXOOY", "https://www.youtube.com/watch?v=JD-kMIpDfnY"}
+
+// Channels returns a fresh array of display names in mixer order.
+func Channels() [5]string {
+	return [5]string{"Rainfall", "Brown noise", "Ocean hush", "Birdsong", "Fireplace"}
+}
+
+// Station pairs a display name with its YouTube page URL, not a direct audio stream.
+type Station struct {
+	Name string // Name is the label shown in the TUI.
+	URL  string // URL identifies the remote YouTube page.
+}
+
+// Stations returns the radio catalog by value so callers cannot change shared state.
+func Stations() [4]Station {
+	return [4]Station{
+		{Name: "Lofi Girl · study", URL: "https://www.youtube.com/watch?v=rFZHOHl-L8A"},
+		{Name: "steezyasfuck · hip hop", URL: "https://www.youtube.com/watch?v=rPjez8z61rI"},
+		{Name: "Lofi Girl · synthwave", URL: "https://www.youtube.com/watch?v=4xDzrJKXOOY"},
+		{Name: "Lofi Girl · sleep/chill", URL: "https://www.youtube.com/watch?v=JD-kMIpDfnY"},
+	}
+}
 
 const rate = 44100
 
+// State is the desired playback snapshot. Mixer and Radio enable their outputs.
+// Volumes contains channel percentages in Channels order; RadioVolume is also 0–100.
+// Station indexes Stations. Increment Chime to request one completion sound.
 type State struct {
 	Mixer       bool
 	Volumes     [5]int
@@ -38,25 +61,48 @@ type State struct {
 	RadioVolume int
 	Chime       int
 }
+
+// Event reports a recoverable playback failure. Message is safe to show in the TUI.
+// RadioFailed and MixerFailed identify which requested output should be stopped.
 type Event struct {
 	Message     string
 	RadioFailed bool
 	MixerFailed bool
 }
+
+// Engine serializes audio work in an owned goroutine.
+// Use New to construct it and Close to release it. Set and Close are safe
+// to call concurrently; drain Events to observe playback failures.
 type Engine struct {
 	updates chan State
-	Events  chan Event
+	events  chan Event
 	cancel  context.CancelFunc
 	done    chan struct{}
 	once    sync.Once
 }
 
+// New starts an idle audio worker without starting playback.
+// The caller must call Close even when no audio was requested. Initialization
+// and playback errors are reported asynchronously through Events.
 func New() *Engine {
 	ctx, cancel := context.WithCancel(context.Background())
-	e := &Engine{updates: make(chan State, 1), Events: make(chan Event, 16), cancel: cancel, done: make(chan struct{})}
+	e := &Engine{
+		updates: make(chan State, 1),
+		events:  make(chan Event, 16),
+		cancel:  cancel,
+		done:    make(chan struct{}),
+	}
 	go e.run(ctx)
 	return e
 }
+
+// Events returns playback failures until the worker stops and closes the channel.
+// The channel is receive-only; callers do not own its lifetime.
+func (e *Engine) Events() <-chan Event { return e.events }
+
+// Set submits the latest desired state without blocking on playback.
+// Queued snapshots may be coalesced. Volumes must be 0–100 and Station must
+// index Stations. Set after Close has no effect.
 func (e *Engine) Set(s State) {
 	select {
 	case e.updates <- s:
@@ -71,10 +117,18 @@ func (e *Engine) Set(s State) {
 		}
 	}
 }
-func (e *Engine) Close() { e.once.Do(e.cancel); <-e.done }
+
+// Close cancels playback and waits for the worker and player processes to stop.
+// It is safe to call more than once. Events closes when the worker exits.
+func (e *Engine) Close() {
+	e.once.Do(e.cancel)
+	<-e.done
+}
+
+// report queues a failure without stalling audio when the event buffer is full.
 func (e *Engine) report(v Event) {
 	select {
-	case e.Events <- v:
+	case e.events <- v:
 	default:
 	}
 }
@@ -85,6 +139,8 @@ type process struct {
 	input io.WriteCloser
 }
 
+// start launches mpv in its own process group, optionally accepting PCM on stdin.
+// The owner must consume done or call stop; cancellation also kills helper processes.
 func start(ctx context.Context, args []string, pipe bool) (*process, error) {
 	cmd := exec.CommandContext(ctx, "mpv", args...)
 	// mpv may start yt-dlp. Cancel the entire private group to avoid orphan helpers.
@@ -111,9 +167,17 @@ func start(ctx context.Context, args []string, pipe bool) (*process, error) {
 		}
 		return nil, err
 	}
-	go func() { err := cmd.Wait(); _ = cmd.Cancel(); p.done <- err }()
+	go func() {
+		err := cmd.Wait()
+		// The player may have exited while an extractor child is still running.
+		_ = cmd.Cancel()
+		p.done <- err
+	}()
 	return p, nil
 }
+
+// stop terminates a player group and waits for it to be reaped.
+// A nil player is harmless; a non-nil player must be stopped only once.
 func (p *process) stop() {
 	if p == nil {
 		return
@@ -124,18 +188,65 @@ func (p *process) stop() {
 	_ = p.cmd.Cancel()
 	<-p.done
 }
+
+// radioVolume sends a bounded IPC volume request; failures can be retried
+// while mpv is creating its socket.
 func radioVolume(socket string, v int) error {
-	c, e := net.DialTimeout("unix", socket, 30*time.Millisecond)
-	if e != nil {
-		return e
+	conn, err := net.DialTimeout("unix", socket, 30*time.Millisecond)
+	if err != nil {
+		return err
 	}
-	defer c.Close()
-	_ = c.SetDeadline(time.Now().Add(30 * time.Millisecond))
-	return json.NewEncoder(c).Encode(map[string]any{"command": []any{"set_property", "volume", v}})
+	defer conn.Close()
+	if err := conn.SetDeadline(time.Now().Add(30 * time.Millisecond)); err != nil {
+		return err
+	}
+	return json.NewEncoder(conn).Encode(map[string]any{"command": []any{"set_property", "volume", v}})
 }
+
+// startRadio checks the extractor dependency and starts the selected station.
+func startRadio(ctx context.Context, socket string, state State) (*process, error) {
+	if _, err := exec.LookPath("yt-dlp"); err != nil {
+		return nil, fmt.Errorf("rádio: instale yt-dlp no PATH: %w", err)
+	}
+	args := []string{
+		"--no-config",
+		"--no-video",
+		"--no-terminal",
+		"--ytdl=yes",
+		"--network-timeout=15",
+		"--ytdl-format=bestaudio/best",
+		"--script-opts=ytdl_hook-ytdl_path=yt-dlp",
+		"--input-ipc-server=" + socket,
+		fmt.Sprintf("--volume=%d", state.RadioVolume),
+		"--", Stations()[state.Station].URL,
+	}
+	player, err := start(ctx, args, false)
+	if err != nil {
+		return nil, fmt.Errorf("rádio: não foi possível iniciar mpv: %w", err)
+	}
+	return player, nil
+}
+
+// startPCM opens an mpv output accepting the synthesizer's stereo PCM format.
+func startPCM(ctx context.Context) (*process, error) {
+	return start(ctx, []string{
+		"--no-config",
+		"--no-video",
+		"--no-terminal",
+		"--cache=no",
+		"--demuxer=rawaudio",
+		"--demuxer-rawaudio-rate=44100",
+		"--demuxer-rawaudio-channels=stereo",
+		"--demuxer-rawaudio-format=s16le",
+		"--audio-buffer=0.1",
+		"-",
+	}, true)
+}
+
+// run owns mutable playback state until cancellation and releases all resources on exit.
 func (e *Engine) run(ctx context.Context) {
 	defer close(e.done)
-	defer close(e.Events)
+	defer close(e.events)
 	dir, err := os.MkdirTemp("", "lofi-chill-")
 	if err != nil {
 		e.report(Event{Message: err.Error(), MixerFailed: true, RadioFailed: true})
@@ -143,7 +254,10 @@ func (e *Engine) run(ctx context.Context) {
 	}
 	defer os.RemoveAll(dir)
 	var pcm, radio *process
-	defer func() { pcm.stop(); radio.stop() }()
+	defer func() {
+		pcm.stop()
+		radio.stop()
+	}()
 	var s State
 	var mix synthesizer
 	mix.rng = rand.New(rand.NewSource(1))
@@ -171,17 +285,12 @@ func (e *Engine) run(ctx context.Context) {
 				radio.stop()
 				radio = nil
 				_ = os.Remove(socket)
-				if _, err = exec.LookPath("yt-dlp"); err != nil {
-					e.report(Event{Message: "Rádio: instale yt-dlp e mpv no PATH.", RadioFailed: true})
+				radio, err = startRadio(ctx, socket, next)
+				if err != nil {
+					e.report(Event{Message: err.Error(), RadioFailed: true})
 					next.Radio = false
-				} else {
-					radio, err = start(ctx, []string{"--no-config", "--no-video", "--no-terminal", "--ytdl=yes", "--network-timeout=15", "--ytdl-format=bestaudio/best", "--script-opts=ytdl_hook-ytdl_path=yt-dlp", "--input-ipc-server=" + socket, fmt.Sprintf("--volume=%d", next.RadioVolume), "--", URLs[next.Station]}, false)
-					if err != nil {
-						e.report(Event{Message: "Rádio: não foi possível iniciar mpv.", RadioFailed: true})
-						next.Radio = false
-					}
-					volume = next.RadioVolume
 				}
+				volume = next.RadioVolume
 			} else if !next.Radio && radio != nil {
 				radio.stop()
 				radio = nil
@@ -223,7 +332,7 @@ func (e *Engine) run(ctx context.Context) {
 				}
 				loaded = true
 			}
-			pcm, err = start(ctx, []string{"--no-config", "--no-video", "--no-terminal", "--cache=no", "--demuxer=rawaudio", "--demuxer-rawaudio-rate=44100", "--demuxer-rawaudio-channels=stereo", "--demuxer-rawaudio-format=s16le", "--audio-buffer=0.1", "-"}, true)
+			pcm, err = startPCM(ctx)
 			if err != nil {
 				failed = true
 				mix.chime = 0
@@ -254,6 +363,8 @@ type synthesizer struct {
 	chime     int
 }
 
+// load decodes the embedded recordings and crossfades their loop boundaries.
+// It must finish before the recordings are rendered and is not concurrency-safe.
 func (m *synthesizer) load() error {
 	for i, name := range map[int]string{0: "rain", 3: "birds", 4: "fire"} {
 		b, err := assets.ReadFile("assets/" + name + ".mp3")
@@ -288,6 +399,9 @@ func (m *synthesizer) load() error {
 	}
 	return nil
 }
+
+// render advances the mixer and returns frames of 44.1 kHz stereo signed 16-bit PCM.
+// It smooths gain changes and consumes a pending chime once. Calls must be serialized.
 func (m *synthesizer) render(s State, frames int) []byte {
 	out := make([]byte, frames*4)
 	for frame := 0; frame < frames; frame++ {

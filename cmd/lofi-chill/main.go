@@ -1,3 +1,4 @@
+// Command lofi-chill runs a local Pomodoro, radio, and ambience TUI.
 package main
 
 import (
@@ -13,7 +14,10 @@ import (
 	"lofi-chill/internal/ui"
 )
 
+// main exits only after run has released its terminal and audio resources.
 func main() { os.Exit(run()) }
+
+// run handles CLI flags and the interactive session, returning a process exit code.
 func run() int {
 	flags := flag.NewFlagSet("lofi-chill", flag.ContinueOnError)
 	version := flags.Bool("version", false, "mostrar versão")

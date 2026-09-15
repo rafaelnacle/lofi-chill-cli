@@ -1,3 +1,4 @@
+// Package ui presents the Pomodoro, radio, and mixer through Bubble Tea.
 package ui
 
 import (
@@ -15,9 +16,10 @@ import (
 	"lofi-chill/internal/timer"
 )
 
-var purple = lipgloss.Color("141")
-var pink = lipgloss.Color("212")
-var cyan = lipgloss.Color("87")
+const purple = lipgloss.Color("141")
+const pink = lipgloss.Color("212")
+const cyan = lipgloss.Color("87")
+
 var muted = lipgloss.NewStyle().Foreground(lipgloss.Color("245"))
 var accent = lipgloss.NewStyle().Foreground(cyan).Bold(true)
 
@@ -27,6 +29,10 @@ type persistence struct {
 	mu     sync.Mutex
 	closed bool
 }
+
+// Model owns TUI state and implements tea.Model.
+// Bubble Tea must serialize Update calls; background commands return messages
+// rather than mutate Model. The caller owns the audio engine passed to New.
 type Model struct {
 	writes                       *persistence
 	helpOffset                   int
@@ -41,11 +47,24 @@ type Model struct {
 	persist                      bool
 }
 
+// New builds a stopped interface from c and the caller-owned engine.
+// A non-nil warning is displayed and disables persistence to preserve an unreadable
+// or unsupported configuration file. path is used for subsequent preference saves.
 func New(c config.Config, path string, engine *audio.Engine, warning error) Model {
-	m := Model{writes: &persistence{}, timer: timer.New(time.Now(), c.Durations, c.Day, c.Completed), cfg: c, path: path, engine: engine, width: 80, height: 24, persist: warning == nil, notice: "Uma coisa de cada vez. Seu espaço está pronto."}
+	m := Model{
+		writes:  &persistence{},
+		timer:   timer.New(time.Now(), c.Durations, c.Day, c.Completed),
+		cfg:     c,
+		path:    path,
+		engine:  engine,
+		width:   80,
+		height:  24,
+		persist: warning == nil,
+		notice:  "Uma coisa de cada vez. Seu espaço está pronto.",
+	}
 	m.sound.Station = c.Station
 	m.sound.RadioVolume = c.RadioVolume
-	for i, k := range config.Channels {
+	for i, k := range config.Channels() {
 		m.sound.Volumes[i] = c.Volumes[k]
 	}
 	if warning != nil {
@@ -53,29 +72,40 @@ func New(c config.Config, path string, engine *audio.Engine, warning error) Mode
 	}
 	return m
 }
+
+// pulse schedules one timer observation; Update schedules the following pulse.
 func pulse() tea.Cmd {
 	return tea.Tick(100*time.Millisecond, func(t time.Time) tea.Msg { return tick(t) })
 }
+
+// listen waits for one audio failure or worker shutdown without blocking Update.
 func (m Model) listen() tea.Cmd {
 	return func() tea.Msg {
-		event, ok := <-m.engine.Events
+		event, ok := <-m.engine.Events()
 		if !ok {
 			return nil
 		}
 		return event
 	}
 }
+
+// Init starts timer observations and audio-event listening through Bubble Tea commands.
 func (m Model) Init() tea.Cmd { return tea.Batch(pulse(), m.listen()) }
+
+// syncConfig copies persistent preferences and counts, excluding active sessions.
 func (m *Model) syncConfig() {
 	m.cfg.Durations = m.timer.Durations
 	m.cfg.Day = m.timer.Day
 	m.cfg.Completed = m.timer.Completed
 	m.cfg.Station = m.sound.Station
 	m.cfg.RadioVolume = m.sound.RadioVolume
-	for i, k := range config.Channels {
+	for i, k := range config.Channels() {
 		m.cfg.Volumes[k] = m.sound.Volumes[i]
 	}
 }
+
+// save snapshots dirty preferences and schedules at most one asynchronous write.
+// The shared lock prevents a pending command from overwriting the final exit save.
 func (m *Model) save() tea.Cmd {
 	if !m.persist || !m.dirty || m.saving {
 		return nil
@@ -99,6 +129,9 @@ func (m *Model) save() tea.Cmd {
 		return saved{config.Save(path, c)}
 	}
 }
+
+// Update applies one keyboard, clock, resize, or background-result message.
+// It returns the next model and commands for work outside the event loop.
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 	before, day, count := m.timer.Completion, m.timer.Day, m.timer.Completed
@@ -210,7 +243,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.engine.Set(m.sound)
 	}
 	if m.timer.Completion != before {
-		m.notice = "Sessão concluída. " + timer.Labels[m.timer.Mode] + " pronta para iniciar."
+		m.notice = "Sessão concluída. " + m.timer.Mode.String() + " pronta para iniciar."
 		if m.cfg.Chime {
 			m.sound.Chime++
 			m.engine.Set(m.sound)
@@ -222,6 +255,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	cmds = append(cmds, m.save())
 	return m, tea.Batch(cmds...)
 }
+
+// SaveOnExit writes final preferences and prevents older queued saves from replacing them.
+// It returns storage errors and does nothing when persistence was disabled.
+// Call it after the Bubble Tea program has stopped.
 func (m Model) SaveOnExit() error {
 	if !m.persist {
 		return nil
@@ -232,12 +269,16 @@ func (m Model) SaveOnExit() error {
 	m.syncConfig()
 	return config.Save(m.path, m.cfg)
 }
+
+// on returns a textual state marker that remains meaningful without color.
 func on(v bool) string {
 	if v {
 		return "ON"
 	}
 	return "OFF"
 }
+
+// timerView renders the countdown, session actions, and daily progress.
 func (m Model) timerView() string {
 	tabs := make([]string, 3)
 	for i, s := range [3]string{"Foco", "Curta", "Longa"} {
@@ -260,12 +301,16 @@ func (m Model) timerView() string {
 	}
 	return strings.Join(tabs, "  ") + "\n\n" + lipgloss.NewStyle().Foreground(pink).Bold(true).Render("  "+clock) + "\n\n" + accent.Render("[espaço] "+status) + fmt.Sprintf("\n[r] Reset   [-/+] Duração: %d min\n\n%d focos hoje   •   Aviso %s [c]  Testar [t]", m.timer.Durations[m.timer.Mode], m.timer.Completed, on(m.cfg.Chime))
 }
+
+// radioView renders the selected station and playback controls.
 func (m Model) radioView() string {
-	return accent.Render("RÁDIO LOFI") + "\n\n" + audio.Stations[m.sound.Station] + fmt.Sprintf("\n\n[%s]  [p] Tocar/parar\n[,] Volume %d%% [.]\n[ / ] Estação anterior/próxima", on(m.sound.Radio), m.sound.RadioVolume)
+	return accent.Render("RÁDIO LOFI") + "\n\n" + audio.Stations()[m.sound.Station].Name + fmt.Sprintf("\n\n[%s]  [p] Tocar/parar\n[,] Volume %d%% [.]\n[ / ] Estação anterior/próxima", on(m.sound.Radio), m.sound.RadioVolume)
 }
+
+// mixerView renders channel levels and the keyboard selection.
 func (m Model) mixerView() string {
 	rows := []string{accent.Render("SET THE MOOD") + "  [m] " + on(m.sound.Mixer), ""}
-	for i, name := range audio.Names {
+	for i, name := range audio.Channels() {
 		v := m.sound.Volumes[i]
 		bar := strings.Repeat("━", v/10) + strings.Repeat("·", 10-v/10)
 		prefix := "  "
@@ -280,9 +325,14 @@ func (m Model) mixerView() string {
 	}
 	return strings.Join(rows, "\n") + "\n\n↑/↓ Canal   ←/→ Volume"
 }
+
+// panel frames content within the requested terminal width.
 func panel(content string, width int) string {
 	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(purple).Width(width - 4).Padding(1).Render(content)
 }
+
+// View renders the current state within the available terminal dimensions.
+// Compact terminals show one panel at a time; rendering has no external side effects.
 func (m Model) View() string {
 	if m.width < 30 || m.height < 10 {
 		return fit("lofi & chill\nAmplie para 30×10.\nEspaço: timer · q: sair", m.width, m.height)
@@ -312,11 +362,11 @@ func (m Model) View() string {
 		session := m.timer.Sessions[m.timer.Mode]
 		sec := int(math.Ceil(session.Remaining.Seconds()))
 		if m.page == 0 || m.focus {
-			body = fmt.Sprintf("%s  %02d:%02d\nEspaço: iniciar/pausar/retomar\n1/2/3 modo · r reset · +/- duração\n%d min · %d focos hoje · aviso %s", timer.Labels[m.timer.Mode], sec/60, sec%60, m.timer.Durations[m.timer.Mode], m.timer.Completed, on(m.cfg.Chime))
+			body = fmt.Sprintf("%s  %02d:%02d\nEspaço: iniciar/pausar/retomar\n1/2/3 modo · r reset · +/- duração\n%d min · %d focos hoje · aviso %s", m.timer.Mode.String(), sec/60, sec%60, m.timer.Durations[m.timer.Mode], m.timer.Completed, on(m.cfg.Chime))
 		} else if m.page == 2 {
-			body = fmt.Sprintf("MIXER %s [m] · canal %d/5\n%s: %d%%\n↑/↓ canal · ←/→ volume", on(m.sound.Mixer), m.channel+1, audio.Names[m.channel], m.sound.Volumes[m.channel])
+			body = fmt.Sprintf("MIXER %s [m] · canal %d/5\n%s: %d%%\n↑/↓ canal · ←/→ volume", on(m.sound.Mixer), m.channel+1, audio.Channels()[m.channel], m.sound.Volumes[m.channel])
 		} else {
-			body = fmt.Sprintf("RÁDIO %s [p]\n%s\n[/] estação · ,/. volume %d%%", on(m.sound.Radio), audio.Stations[m.sound.Station], m.sound.RadioVolume)
+			body = fmt.Sprintf("RÁDIO %s [p]\n%s\n[/] estação · ,/. volume %d%%", on(m.sound.Radio), audio.Stations()[m.sound.Station].Name, m.sound.RadioVolume)
 		}
 	}
 	lines := strings.Split(body, "\n")
@@ -331,6 +381,8 @@ func (m Model) View() string {
 	}
 	return fit(title+"\n\n"+strings.Join(lines, "\n")+"\n"+muted.Render(m.notice)+"\n"+footer, m.width, m.height)
 }
+
+// fit clips lines by terminal cell width while preserving ANSI escape sequences.
 func fit(s string, width, height int) string {
 	lines := strings.Split(s, "\n")
 	if len(lines) > height {
@@ -342,9 +394,20 @@ func fit(s string, width, height int) string {
 	return strings.Join(lines, "\n")
 }
 
+// bigClock draws decimal digits and a colon as a three-line display.
 func bigClock(value string) string {
 	glyphs := map[rune][3]string{
-		'0': {"█▀█", "█ █", "█▄█"}, '1': {" ▀█", "  █", "  █"}, '2': {"▀▀█", "█▀▀", "█▄▄"}, '3': {"▀▀█", " ▀█", "▄▄█"}, '4': {"█ █", "▀▀█", "  █"}, '5': {"█▀▀", "▀▀█", "▄▄█"}, '6': {"█▀▀", "█▀█", "█▄█"}, '7': {"▀▀█", "  █", "  █"}, '8': {"█▀█", "█▀█", "█▄█"}, '9': {"█▀█", "▀▀█", "▄▄█"}, ':': {" ▄ ", "   ", " ▀ "},
+		'0': {"█▀█", "█ █", "█▄█"},
+		'1': {" ▀█", "  █", "  █"},
+		'2': {"▀▀█", "█▀▀", "█▄▄"},
+		'3': {"▀▀█", " ▀█", "▄▄█"},
+		'4': {"█ █", "▀▀█", "  █"},
+		'5': {"█▀▀", "▀▀█", "▄▄█"},
+		'6': {"█▀▀", "█▀█", "█▄█"},
+		'7': {"▀▀█", "  █", "  █"},
+		'8': {"█▀█", "█▀█", "█▄█"},
+		'9': {"█▀█", "▀▀█", "▄▄█"},
+		':': {" ▄ ", "   ", " ▀ "},
 	}
 	rows := [3]string{}
 	for _, digit := range value {

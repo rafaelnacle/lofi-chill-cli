@@ -11,6 +11,11 @@
 
 ## Desenvolvimento em Go
 
+- Siga os princípios do [Zen of Go](https://the-zen-of-go.netlify.app/): pacotes com propósito único, erros explícitos, retornos antecipados, pouco estado global mutável e concorrência com ciclo de vida definido. Priorize manutenção e clareza; meça antes de otimizar.
+- Documente pacotes e declarações exportadas conforme [Go Doc Comments](https://go.dev/doc/comment). O comentário deve começar pelo nome declarado e explicar comportamento, retornos, erros e restrições relevantes, incluindo concorrência e propriedade dos recursos.
+- Comente funções internas quando isso esclarecer sua finalidade ou um contrato não evidente. Não substitua nomes claros por comentários que apenas repetem o código.
+- Use uma versão estável suportada do Go, declarada no `go.mod`, e valide mudanças de versão com testes e compilação. Go não tem edição LTS; confirme a versão atual e a política de suporte nas fontes oficiais antes de atualizar.
+
 - Prefira soluções simples, código legível e mudanças focadas na tarefa. Não refatore código funcional sem relação com o pedido.
 - Siga a estrutura e as convenções existentes; ao iniciar o projeto, adote uma estrutura enxuta, sem pacotes, interfaces ou camadas especulativas.
 - Adicione dependências somente quando trouxerem benefício claro. Prefira a biblioteca padrão quando ela atender bem ao requisito.

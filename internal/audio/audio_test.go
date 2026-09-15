@@ -57,7 +57,7 @@ func TestMissingPlayerAndShutdown(t *testing.T) {
 	e := New()
 	e.Set(State{Radio: true})
 	select {
-	case v := <-e.Events:
+	case v := <-e.Events():
 		if !v.RadioFailed {
 			t.Fatal(v)
 		}
@@ -110,7 +110,7 @@ func TestPCMProcessLifecycle(t *testing.T) {
 	defer ticker.Stop()
 	for {
 		select {
-		case event := <-e.Events:
+		case event := <-e.Events():
 			t.Fatal(event)
 		case <-deadline:
 			t.Fatal("PCM player did not receive audio")
