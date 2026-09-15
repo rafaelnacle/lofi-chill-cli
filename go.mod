@@ -1,6 +1,6 @@
 module lofi-chill
 
-go 1.24.0
+go 1.27.1
 
 require (
 	github.com/charmbracelet/bubbletea v1.3.10

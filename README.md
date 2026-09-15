@@ -4,7 +4,7 @@ Pomodoro, rádio lofi e cinco sons ambientes em uma TUI synthwave para terminal,
 
 ## Instalação
 
-Requer Go 1.24 ou superior. A integração de áudio foi feita para Linux e macOS; o rádio usa sockets Unix e não oferece suporte a Windows nesta versão.
+Requer Go 1.27.1 ou superior. A integração de áudio foi feita para Linux e macOS; o rádio usa sockets Unix e não oferece suporte a Windows nesta versão.
 
 ```sh
 go build -o bin/lofi-chill ./cmd/lofi-chill
