@@ -2,15 +2,11 @@
 package ui
 
 import (
-	"fmt"
-	"math"
-	"strings"
 	"sync"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
 	"lofi-chill/internal/audio"
 	"lofi-chill/internal/config"
 	"lofi-chill/internal/timer"
@@ -36,6 +32,8 @@ type persistence struct {
 type Model struct {
 	writes                       *persistence
 	helpOffset                   int
+	timerRow, radioRow           int
+	radioStatus, mixerStatus     string
 	timer                        timer.Timer
 	cfg                          config.Config
 	path                         string
@@ -52,15 +50,17 @@ type Model struct {
 // or unsupported configuration file. path is used for subsequent preference saves.
 func New(c config.Config, path string, engine *audio.Engine, warning error) Model {
 	m := Model{
-		writes:  &persistence{},
-		timer:   timer.New(time.Now(), c.Durations, c.Day, c.Completed),
-		cfg:     c,
-		path:    path,
-		engine:  engine,
-		width:   80,
-		height:  24,
-		persist: warning == nil,
-		notice:  "Uma coisa de cada vez. Seu espaço está pronto.",
+		writes:      &persistence{},
+		timer:       timer.New(time.Now(), c.Durations, c.Day, c.Completed),
+		cfg:         c,
+		path:        path,
+		engine:      engine,
+		width:       80,
+		height:      24,
+		persist:     warning == nil,
+		notice:      "Uma coisa de cada vez. Seu espaço está pronto.",
+		radioStatus: "Parado", mixerStatus: "Pausado",
+		timerRow: 2, radioRow: 2,
 	}
 	m.sound.Station = c.Station
 	m.sound.RadioVolume = c.RadioVolume
@@ -149,14 +149,35 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.persist = false
 		}
 	case audio.Event:
-		m.notice = v.Message
-		if v.RadioFailed {
+		radioEvent := v.RadioRequest == m.sound.RadioRequest && m.sound.Radio
+		mixerEvent := v.MixerRequest == m.sound.MixerRequest && m.sound.Mixer
+		if radioEvent && v.RadioFailed {
 			m.sound.Radio = false
+			m.radioStatus = "Falhou"
+			m.notice = v.Message
 		}
-		if v.MixerFailed {
+		if mixerEvent && v.MixerFailed {
 			m.sound.Mixer = false
+			m.mixerStatus = "Falhou"
+			m.notice = v.Message
 		}
-		m.engine.Set(m.sound)
+		if !v.RadioFailed && radioEvent && v.RadioStatus != "" {
+			if v.RadioStatus == audio.Playing && m.radioStatus != string(audio.Playing) {
+				m.notice = "Rádio tocando."
+			}
+			m.radioStatus = string(v.RadioStatus)
+		}
+		if !v.MixerFailed && mixerEvent && v.MixerStatus != "" {
+			if v.MixerStatus == audio.Playing && m.mixerStatus != string(audio.Playing) {
+				m.notice = "Sons ambientes prontos. Ajuste os volumes com ←/→."
+			}
+			m.mixerStatus = string(v.MixerStatus)
+		}
+		// A failed chime still needs feedback when the mixer is paused.
+		if v.MixerFailed && v.MixerRequest == m.sound.MixerRequest && !mixerEvent {
+			m.notice = v.Message
+		}
+		m.sendSound()
 		cmds = append(cmds, m.listen())
 	case tea.KeyMsg:
 		key := v.String()
@@ -170,12 +191,16 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if key == "esc" {
-			m.help = false
+			if m.help {
+				m.help = false
+			} else {
+				m.focus = false
+			}
 			return m, nil
 		}
-		if m.help {
+		if m.help && key != " " {
 			if key == "down" || key == "j" {
-				m.helpOffset = min(20, m.helpOffset+1)
+				m.helpOffset = min(max(0, len(helpLines())-m.bodyHeight()), m.helpOffset+1)
 			}
 			if key == "up" || key == "k" {
 				m.helpOffset = max(0, m.helpOffset-1)
@@ -199,19 +224,24 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.dirty = true
 		case "tab":
 			m.page = (m.page + 1) % 3
+			m.focus = false
 		case "shift+tab":
 			m.page = (m.page + 2) % 3
+			m.focus = false
 		case "f":
 			m.focus = !m.focus
+			if m.focus {
+				m.page = 0
+			}
 		case "m":
-			m.sound.Mixer = !m.sound.Mixer
+			m.toggleMixer()
 		case "p":
-			m.sound.Radio = !m.sound.Radio
+			m.toggleRadio()
 		case "[":
-			m.sound.Station = (m.sound.Station + 3) % 4
+			m.changeStation(-1)
 			m.dirty = true
 		case "]":
-			m.sound.Station = (m.sound.Station + 1) % 4
+			m.changeStation(1)
 			m.dirty = true
 		case ",":
 			m.sound.RadioVolume = max(0, m.sound.RadioVolume-5)
@@ -220,19 +250,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sound.RadioVolume = min(100, m.sound.RadioVolume+5)
 			m.dirty = true
 		case "up", "k":
-			m.channel = (m.channel + 4) % 5
-			m.page = 2
+			m.selectItem(-1)
 		case "down", "j":
-			m.channel = (m.channel + 1) % 5
-			m.page = 2
+			m.selectItem(1)
 		case "left", "h":
-			m.sound.Volumes[m.channel] = max(0, m.sound.Volumes[m.channel]-5)
-			m.page = 2
-			m.dirty = true
+			m.adjustItem(-1, now)
 		case "right", "l":
-			m.sound.Volumes[m.channel] = min(100, m.sound.Volumes[m.channel]+5)
-			m.page = 2
-			m.dirty = true
+			m.adjustItem(1, now)
+		case "enter":
+			m.activateItem(now)
 		case "c":
 			m.cfg.Chime = !m.cfg.Chime
 			m.dirty = true
@@ -240,13 +266,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.sound.Chime++
 			m.notice = "Teste do aviso sonoro."
 		}
-		m.engine.Set(m.sound)
+		m.sendSound()
 	}
 	if m.timer.Completion != before {
 		m.notice = "Sessão concluída. " + m.timer.Mode.String() + " pronta para iniciar."
 		if m.cfg.Chime {
 			m.sound.Chime++
-			m.engine.Set(m.sound)
+			m.sendSound()
 		}
 	}
 	if day != m.timer.Day || count != m.timer.Completed {
@@ -270,150 +296,119 @@ func (m Model) SaveOnExit() error {
 	return config.Save(m.path, m.cfg)
 }
 
-// on returns a textual state marker that remains meaningful without color.
-func on(v bool) string {
-	if v {
-		return "ON"
+// sendSound submits an audio snapshot without coupling layout tests to a player.
+func (m Model) sendSound() {
+	if m.engine != nil {
+		m.engine.Set(m.sound)
 	}
-	return "OFF"
 }
 
-// timerView renders the countdown, session actions, and daily progress.
-func (m Model) timerView() string {
-	tabs := make([]string, 3)
-	for i, s := range [3]string{"Foco", "Curta", "Longa"} {
-		tabs[i] = fmt.Sprintf("%d %s", i+1, s)
-		if i == int(m.timer.Mode) {
-			tabs[i] = accent.Render("[" + tabs[i] + "]")
+// selectItem moves selection within the active panel without changing playback.
+func (m *Model) selectItem(delta int) {
+	switch m.page {
+	case 0:
+		m.timerRow = (m.timerRow + delta + 6) % 6
+	case 1:
+		m.radioRow = (m.radioRow + delta + 3) % 3
+	case 2:
+		m.channel = (m.channel + delta + 6) % 6
+	}
+}
+
+// adjustItem changes only the selected control, preserving independent timer sessions.
+func (m *Model) adjustItem(delta int, now time.Time) {
+	switch m.page {
+	case 0:
+		switch m.timerRow {
+		case 0:
+			m.timer.Switch(timer.Mode((int(m.timer.Mode)+delta+3)%3), now)
+		case 1:
+			m.timer.SetDuration(m.timer.Mode, m.timer.Durations[m.timer.Mode]+delta)
+			m.dirty = true
+		case 4:
+			m.cfg.Chime = delta > 0
+			m.dirty = true
+		}
+	case 1:
+		switch m.radioRow {
+		case 0:
+			m.changeStation(delta)
+		case 1:
+			m.sound.RadioVolume = min(100, max(0, m.sound.RadioVolume+delta*5))
+			m.dirty = true
+		}
+	case 2:
+		if m.channel < 5 {
+			m.sound.Volumes[m.channel] = min(100, max(0, m.sound.Volumes[m.channel]+delta*5))
+			m.dirty = true
 		}
 	}
-	session := m.timer.Sessions[m.timer.Mode]
-	sec := int(math.Ceil(session.Remaining.Seconds()))
-	status := "Iniciar"
-	if !m.timer.Deadline.IsZero() {
-		status = "Pausar · em andamento"
-	} else if session.Started {
-		status = "Retomar / Resume · pausado"
-	}
-	clock := fmt.Sprintf("%02d:%02d", sec/60, sec%60)
-	if m.width >= 46 && m.height >= 22 {
-		clock = bigClock(clock)
-	}
-	return strings.Join(tabs, "  ") + "\n\n" + lipgloss.NewStyle().Foreground(pink).Bold(true).Render("  "+clock) + "\n\n" + accent.Render("[espaço] "+status) + fmt.Sprintf("\n[r] Reset   [-/+] Duração: %d min\n\n%d focos hoje   •   Aviso %s [c]  Testar [t]", m.timer.Durations[m.timer.Mode], m.timer.Completed, on(m.cfg.Chime))
 }
 
-// radioView renders the selected station and playback controls.
-func (m Model) radioView() string {
-	return accent.Render("RÁDIO LOFI") + "\n\n" + audio.Stations()[m.sound.Station].Name + fmt.Sprintf("\n\n[%s]  [p] Tocar/parar\n[,] Volume %d%% [.]\n[ / ] Estação anterior/próxima", on(m.sound.Radio), m.sound.RadioVolume)
-}
-
-// mixerView renders channel levels and the keyboard selection.
-func (m Model) mixerView() string {
-	rows := []string{accent.Render("SET THE MOOD") + "  [m] " + on(m.sound.Mixer), ""}
-	for i, name := range audio.Channels() {
-		v := m.sound.Volumes[i]
-		bar := strings.Repeat("━", v/10) + strings.Repeat("·", 10-v/10)
-		prefix := "  "
-		if i == m.channel {
-			prefix = "> "
+// activateItem performs the selected action; Space remains a global timer shortcut.
+func (m *Model) activateItem(now time.Time) {
+	switch m.page {
+	case 0:
+		switch m.timerRow {
+		case 0:
+			m.adjustItem(1, now)
+		case 2:
+			m.timer.Toggle(now)
+		case 3:
+			m.timer.Reset(now)
+			m.notice = "Sessão reiniciada."
+		case 4:
+			m.cfg.Chime = !m.cfg.Chime
+			m.dirty = true
+		case 5:
+			m.sound.Chime++
+			m.notice = "Teste do aviso sonoro."
 		}
-		row := fmt.Sprintf("%s%-12s %s %3d%%", prefix, name, bar, v)
-		if i == m.channel {
-			row = accent.Render(row)
+	case 1:
+		if m.radioRow == 0 {
+			m.changeStation(1)
 		}
-		rows = append(rows, row)
+		if m.radioRow == 2 {
+			m.toggleRadio()
+		}
+	case 2:
+		m.toggleMixer()
 	}
-	return strings.Join(rows, "\n") + "\n\n↑/↓ Canal   ←/→ Volume"
 }
 
-// panel frames content within the requested terminal width.
-func panel(content string, width int) string {
-	return lipgloss.NewStyle().Border(lipgloss.RoundedBorder()).BorderForeground(purple).Width(width - 4).Padding(1).Render(content)
+// toggleRadio starts a fresh request or cancels playback, invalidating stale events.
+func (m *Model) toggleRadio() {
+	m.sound.Radio = !m.sound.Radio
+	m.sound.RadioRequest++
+	m.radioStatus = "Parado"
+	m.notice = "Rádio parado."
+	if m.sound.Radio {
+		m.radioStatus = string(audio.Connecting)
+		m.notice = "Conectando ao rádio…"
+	}
 }
 
-// View renders the current state within the available terminal dimensions.
-// Compact terminals show one panel at a time; rendering has no external side effects.
-func (m Model) View() string {
-	if m.width < 30 || m.height < 10 {
-		return fit("lofi & chill\nAmplie para 30×10.\nEspaço: timer · q: sair", m.width, m.height)
+// toggleMixer changes the requested mixer state and invalidates old status events.
+func (m *Model) toggleMixer() {
+	m.sound.Mixer = !m.sound.Mixer
+	m.sound.MixerRequest++
+	m.mixerStatus = "Pausado"
+	m.notice = "Sons ambientes pausados."
+	if m.sound.Mixer {
+		m.mixerStatus = "Preparando"
+		m.notice = "Preparando sons ambientes…"
 	}
-	title := lipgloss.NewStyle().Bold(true).Foreground(pink).Render("▰ lofi & chill") + muted.Render("  /  SIDE A — FOCUS")
-	footer := muted.Render("espaço timer · tab painel · f foco · ? ajuda · q sair")
-	var body string
-	if m.help {
-		body = "ATALHOS\n\n1 / 2 / 3   Foco / pausa curta / longa\nespaço      Iniciar, pausar ou retomar\nr           Reset da sessão atual\n- / +       Duração do modo (1–120 min)\np           Tocar/parar rádio\n[ / ]       Escolher estação\n, / .       Volume do rádio\nm           Play/pause do mixer\n↑ / ↓       Selecionar canal (j/k)\n← / →       Volume do canal (h/l)\nc / t       Aviso on/off / testar\ntab         Trocar painel\nf           Modo foco\n? / esc     Fechar ajuda\nq / ctrl+c  Sair\n\nÁudio e sessões não retomam ao reabrir."
-	} else if m.focus {
-		body = panel(m.timerView(), m.width)
-	} else if m.width >= 100 && m.height >= 31 {
-		left := m.width / 2
-		body = lipgloss.JoinHorizontal(lipgloss.Top, panel(m.timerView(), left), panel(m.radioView(), m.width-left)) + "\n" + panel(m.mixerView(), m.width)
+}
+
+// changeStation preserves playback intent while switching the selected station.
+func (m *Model) changeStation(delta int) {
+	m.sound.Station = (m.sound.Station + delta + len(audio.Stations())) % len(audio.Stations())
+	m.sound.RadioRequest++
+	if m.sound.Radio {
+		m.radioStatus = string(audio.Connecting)
+		m.notice = "Conectando ao rádio…"
 	} else {
-		nav := []string{"POMODORO", "RÁDIO", "MIXER"}
-		for i := range nav {
-			if i == m.page {
-				nav[i] = accent.Render("[" + nav[i] + "]")
-			}
-		}
-		body = strings.Join(nav, "  ") + "\n"
-		views := []string{m.timerView(), m.radioView(), m.mixerView()}
-		body += views[m.page]
+		m.radioStatus = "Parado"
 	}
-	if m.height < 18 && !m.help {
-		session := m.timer.Sessions[m.timer.Mode]
-		sec := int(math.Ceil(session.Remaining.Seconds()))
-		if m.page == 0 || m.focus {
-			body = fmt.Sprintf("%s  %02d:%02d\nEspaço: iniciar/pausar/retomar\n1/2/3 modo · r reset · +/- duração\n%d min · %d focos hoje · aviso %s", m.timer.Mode.String(), sec/60, sec%60, m.timer.Durations[m.timer.Mode], m.timer.Completed, on(m.cfg.Chime))
-		} else if m.page == 2 {
-			body = fmt.Sprintf("MIXER %s [m] · canal %d/5\n%s: %d%%\n↑/↓ canal · ←/→ volume", on(m.sound.Mixer), m.channel+1, audio.Channels()[m.channel], m.sound.Volumes[m.channel])
-		} else {
-			body = fmt.Sprintf("RÁDIO %s [p]\n%s\n[/] estação · ,/. volume %d%%", on(m.sound.Radio), audio.Stations()[m.sound.Station].Name, m.sound.RadioVolume)
-		}
-	}
-	lines := strings.Split(body, "\n")
-	if m.help {
-		m.helpOffset = min(m.helpOffset, max(0, len(lines)-max(1, m.height-5)))
-		lines = lines[m.helpOffset:]
-		footer = muted.Render("↑/↓ rolar · ?/esc voltar · q sair")
-	}
-	budget := m.height - 5
-	if len(lines) > budget {
-		lines = lines[:max(0, budget)]
-	}
-	return fit(title+"\n\n"+strings.Join(lines, "\n")+"\n"+muted.Render(m.notice)+"\n"+footer, m.width, m.height)
-}
-
-// fit clips lines by terminal cell width while preserving ANSI escape sequences.
-func fit(s string, width, height int) string {
-	lines := strings.Split(s, "\n")
-	if len(lines) > height {
-		lines = lines[:max(0, height)]
-	}
-	for i := range lines {
-		lines[i] = ansi.Truncate(lines[i], max(0, width), "…")
-	}
-	return strings.Join(lines, "\n")
-}
-
-// bigClock draws decimal digits and a colon as a three-line display.
-func bigClock(value string) string {
-	glyphs := map[rune][3]string{
-		'0': {"█▀█", "█ █", "█▄█"},
-		'1': {" ▀█", "  █", "  █"},
-		'2': {"▀▀█", "█▀▀", "█▄▄"},
-		'3': {"▀▀█", " ▀█", "▄▄█"},
-		'4': {"█ █", "▀▀█", "  █"},
-		'5': {"█▀▀", "▀▀█", "▄▄█"},
-		'6': {"█▀▀", "█▀█", "█▄█"},
-		'7': {"▀▀█", "  █", "  █"},
-		'8': {"█▀█", "█▀█", "█▄█"},
-		'9': {"█▀█", "▀▀█", "▄▄█"},
-		':': {" ▄ ", "   ", " ▀ "},
-	}
-	rows := [3]string{}
-	for _, digit := range value {
-		for row := range rows {
-			rows[row] += glyphs[digit][row] + " "
-		}
-	}
-	return strings.Join(rows[:], "\n  ")
+	m.dirty = true
 }

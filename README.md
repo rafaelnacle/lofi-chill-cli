@@ -33,17 +33,21 @@ O rádio reproduz as quatro estações escolhidas do YouTube dentro do app, sem 
 | `1` / `2` / `3` | Foco / pausa curta / pausa longa |
 | `r` | Reset da sessão atual |
 | `-` / `+` | Duração do modo, entre 1 e 120 minutos |
-| `tab` | Alternar painel em terminais compactos |
+| `Tab` / `Shift+Tab` | Selecionar próximo painel / painel anterior |
+| `Enter` | Ativar a ação selecionada |
 | `f` | Modo foco |
 | `p` | Tocar/parar rádio |
 | `[` / `]` | Estação anterior/próxima |
 | `,` / `.` | Volume do rádio |
 | `m` | Play/pause geral do mixer |
-| `↑` / `↓` ou `k` / `j` | Selecionar canal ambiente |
-| `←` / `→` ou `h` / `l` | Volume do canal |
+| `↑` / `↓` ou `k` / `j` | Selecionar item dentro do painel ativo |
+| `←` / `→` ou `h` / `l` | Ajustar modo, duração, estação ou volume selecionado |
 | `c` / `t` | Ativar/desativar aviso / testar som |
 | `?` | Ajuda |
+| `Esc` | Fechar ajuda ou sair do modo foco |
 | `q` / `Ctrl+C` | Sair |
+
+O painel ativo tem um marcador `>` e borda destacada. O timer permanece visível no cabeçalho, e o rodapé mostra os atalhos do item selecionado. O rádio indica conexão, reprodução, parada ou falha; `Tocando` só aparece após confirmação do player.
 
 ## Configuração
 

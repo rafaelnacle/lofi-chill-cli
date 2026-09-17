@@ -28,6 +28,11 @@
 
 ## Interface de terminal
 
+- Tab/Shift+Tab selecionam painéis; setas operam somente no painel ativo; Enter ativa a ação selecionada. Espaço mantém o controle global do timer.
+- Preserve o status do timer no cabeçalho e um rodapé fixo com atalhos contextuais. O foco deve ter marcador textual e destaque visual em todos os tamanhos.
+- Reserve espaço para cabeçalho e rodapé antes de dimensionar painéis. Em terminais pequenos, mantenha o item selecionado visível; não corte controles ou bordas silenciosamente.
+- Diferencie intenção de reprodução de reprodução confirmada pelo player. Ignore eventos atrasados de pedidos de áudio substituídos.
+
 - Preserve a identidade synthwave: roxo, rosa e ciano, com referências a VHS/videocassete e estética old-school. Legibilidade e uso vêm primeiro.
 - Destaque o timer e mantenha os controles principais, o rádio e o mixer fáceis de acessar, evitando rolagem desnecessária.
 - Todas as ações essenciais devem funcionar por teclado. Exiba atalhos e ajuda; deixe claros o foco de navegação, o modo selecionado e os estados de reprodução.
