@@ -54,20 +54,36 @@ const rate = 44100
 // Volumes contains channel percentages in Channels order; RadioVolume is also 0–100.
 // Station indexes Stations. Increment Chime to request one completion sound.
 type State struct {
-	Mixer       bool
-	Volumes     [5]int
-	Radio       bool
-	Station     int
-	RadioVolume int
-	Chime       int
+	Mixer        bool
+	Volumes      [5]int
+	Radio        bool
+	Station      int
+	RadioVolume  int
+	Chime        int
+	RadioRequest int // RadioRequest identifies the latest radio start/stop or station change.
+	MixerRequest int // MixerRequest identifies the latest mixer start/stop.
 }
 
-// Event reports a recoverable playback failure. Message is safe to show in the TUI.
+// Playback identifies the player's observed output state.
+type Playback string
+
+const (
+	// Connecting means playback has not started or is waiting for data.
+	Connecting Playback = "Conectando"
+	// Playing means mpv reports active playback with a valid media position.
+	Playing Playback = "Tocando"
+)
+
+// Event reports observed playback state or a recoverable playback failure. Message is safe to show in the TUI.
 // RadioFailed and MixerFailed identify which requested output should be stopped.
 type Event struct {
-	Message     string
-	RadioFailed bool
-	MixerFailed bool
+	Message      string
+	RadioFailed  bool
+	MixerFailed  bool
+	RadioStatus  Playback // RadioStatus is empty when the event concerns another output.
+	MixerStatus  Playback // MixerStatus is empty when the event concerns another output.
+	RadioRequest int      // RadioRequest associates the event with the initiating request.
+	MixerRequest int      // MixerRequest associates the event with the initiating request.
 }
 
 // Engine serializes audio work in an owned goroutine.
@@ -134,14 +150,16 @@ func (e *Engine) report(v Event) {
 }
 
 type process struct {
-	cmd   *exec.Cmd
-	done  chan error
-	input io.WriteCloser
+	cmd    *exec.Cmd
+	done   chan error
+	input  io.WriteCloser
+	status <-chan Playback
 }
 
 // start launches mpv in its own process group, optionally accepting PCM on stdin.
 // The owner must consume done or call stop; cancellation also kills helper processes.
-func start(ctx context.Context, args []string, pipe bool) (*process, error) {
+func start(ctx context.Context, args []string, pipe bool, socket string) (*process, error) {
+	ctx, cancel := context.WithCancel(ctx)
 	cmd := exec.CommandContext(ctx, "mpv", args...)
 	// mpv may start yt-dlp. Cancel the entire private group to avoid orphan helpers.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -158,6 +176,7 @@ func start(ctx context.Context, args []string, pipe bool) (*process, error) {
 	if pipe {
 		p.input, err = cmd.StdinPipe()
 		if err != nil {
+			cancel()
 			return nil, err
 		}
 	}
@@ -165,10 +184,17 @@ func start(ctx context.Context, args []string, pipe bool) (*process, error) {
 		if p.input != nil {
 			p.input.Close()
 		}
+		cancel()
 		return nil, err
 	}
+	status := make(chan Playback, 1)
+	observed := make(chan struct{})
+	p.status = status
+	go func() { defer close(observed); observePlayback(ctx, socket, status) }()
 	go func() {
 		err := cmd.Wait()
+		cancel()
+		<-observed
 		// The player may have exited while an extractor child is still running.
 		_ = cmd.Cancel()
 		p.done <- err
@@ -220,7 +246,7 @@ func startRadio(ctx context.Context, socket string, state State) (*process, erro
 		fmt.Sprintf("--volume=%d", state.RadioVolume),
 		"--", Stations()[state.Station].URL,
 	}
-	player, err := start(ctx, args, false)
+	player, err := start(ctx, args, false, socket)
 	if err != nil {
 		return nil, fmt.Errorf("rádio: não foi possível iniciar mpv: %w", err)
 	}
@@ -228,7 +254,7 @@ func startRadio(ctx context.Context, socket string, state State) (*process, erro
 }
 
 // startPCM opens an mpv output accepting the synthesizer's stereo PCM format.
-func startPCM(ctx context.Context) (*process, error) {
+func startPCM(ctx context.Context, socket string) (*process, error) {
 	return start(ctx, []string{
 		"--no-config",
 		"--no-video",
@@ -239,8 +265,9 @@ func startPCM(ctx context.Context) (*process, error) {
 		"--demuxer-rawaudio-channels=stereo",
 		"--demuxer-rawaudio-format=s16le",
 		"--audio-buffer=0.1",
+		"--input-ipc-server=" + socket,
 		"-",
-	}, true)
+	}, true, socket)
 }
 
 // run owns mutable playback state until cancellation and releases all resources on exit.
@@ -265,6 +292,12 @@ func (e *Engine) run(ctx context.Context) {
 	var failed bool
 	var lastChime int
 	var socket = filepath.Join(dir, "radio.sock")
+	pcmSocket := filepath.Join(dir, "mixer.sock")
+	report := func(event Event) {
+		event.RadioRequest = s.RadioRequest
+		event.MixerRequest = s.MixerRequest
+		e.report(event)
+	}
 	var volume = -1
 	tick := time.NewTicker(20 * time.Millisecond)
 	defer tick.Stop()
@@ -281,13 +314,15 @@ func (e *Engine) run(ctx context.Context) {
 				lastChime = next.Chime
 				failed = false
 			}
-			if next.Radio && (!s.Radio || next.Station != s.Station) {
+			old := s
+			s = next
+			if next.Radio && (!old.Radio || next.Station != old.Station) {
 				radio.stop()
 				radio = nil
 				_ = os.Remove(socket)
 				radio, err = startRadio(ctx, socket, next)
 				if err != nil {
-					e.report(Event{Message: err.Error(), RadioFailed: true})
+					report(Event{Message: err.Error(), RadioFailed: true})
 					next.Radio = false
 				}
 				volume = next.RadioVolume
@@ -303,7 +338,7 @@ func (e *Engine) run(ctx context.Context) {
 			case <-radio.done:
 				radio = nil
 				s.Radio = false
-				e.report(Event{Message: "Rádio encerrado ou indisponível. Pressione p para tentar novamente.", RadioFailed: true})
+				report(Event{Message: "Rádio encerrado ou indisponível. Pressione p para tentar novamente.", RadioFailed: true})
 			default:
 			}
 			if radio != nil && s.RadioVolume != volume {
@@ -319,7 +354,7 @@ func (e *Engine) run(ctx context.Context) {
 				pcm = nil
 				mix.chime = 0
 				failed = true
-				e.report(Event{Message: "Saída de áudio encerrada. Verifique mpv/dispositivo e tente novamente.", MixerFailed: true})
+				report(Event{Message: "Saída de áudio encerrada. Verifique mpv/dispositivo e tente novamente.", MixerFailed: true})
 			default:
 			}
 		}
@@ -327,17 +362,32 @@ func (e *Engine) run(ctx context.Context) {
 			if !loaded {
 				if err = mix.load(); err != nil {
 					failed = true
-					e.report(Event{Message: err.Error(), MixerFailed: true})
+					report(Event{Message: err.Error(), MixerFailed: true})
 					continue
 				}
 				loaded = true
 			}
-			pcm, err = startPCM(ctx)
+			_ = os.Remove(pcmSocket)
+			pcm, err = startPCM(ctx, pcmSocket)
 			if err != nil {
 				failed = true
 				mix.chime = 0
-				e.report(Event{Message: "Áudio: instale mpv no PATH para mixer e aviso.", MixerFailed: true})
+				report(Event{Message: "Áudio: instale mpv no PATH para mixer e aviso.", MixerFailed: true})
 				continue
+			}
+		}
+		if radio != nil && s.Radio {
+			select {
+			case status := <-radio.status:
+				report(Event{RadioStatus: status})
+			default:
+			}
+		}
+		if pcm != nil && s.Mixer {
+			select {
+			case status := <-pcm.status:
+				report(Event{MixerStatus: status})
+			default:
 			}
 		}
 		if pcm != nil {
@@ -347,7 +397,7 @@ func (e *Engine) run(ctx context.Context) {
 				pcm = nil
 				mix.chime = 0
 				failed = true
-				e.report(Event{Message: "Falha na saída de áudio. Verifique o dispositivo e tente novamente.", MixerFailed: true})
+				report(Event{Message: "Falha na saída de áudio. Verifique o dispositivo e tente novamente.", MixerFailed: true})
 			}
 		}
 	}

@@ -111,7 +111,9 @@ func TestPCMProcessLifecycle(t *testing.T) {
 	for {
 		select {
 		case event := <-e.Events():
-			t.Fatal(event)
+			if event.RadioFailed || event.MixerFailed {
+				t.Fatal(event)
+			}
 		case <-deadline:
 			t.Fatal("PCM player did not receive audio")
 		case <-ticker.C:
